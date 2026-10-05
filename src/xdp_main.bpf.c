@@ -1,71 +1,84 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-#include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/in.h>
+#include <linux/types.h>
 
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#include "kxflow_event.h"
+#include "../include/kxflow_event.h"
+
+
+/* =========================================================
+ * Detection configuration
+ * ========================================================= */
 
 #define SCAN_WINDOW_NS      10000000000ULL
 #define SCAN_PORT_THRESHOLD 10
 
-/* ---------------------------------------------------------
+
+/* =========================================================
  * Flow tracking
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
+
     __type(key, struct flow_key);
     __type(value, struct flow_stats);
 } flows SEC(".maps");
 
 
-/* ---------------------------------------------------------
+/* =========================================================
  * Port-scan tracking
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
+
     __type(key, struct scan_port_key);
     __type(value, __u8);
 } scan_ports SEC(".maps");
 
 
+/* =========================================================
+ * Per-source scan statistics
+ * ========================================================= */
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 16384);
+
     __type(key, __u32);
     __type(value, struct scan_stats);
 } scan_sources SEC(".maps");
 
 
-/* ---------------------------------------------------------
+/* =========================================================
  * Blocked source IPs
- *
- * Source IP -> timestamp when blocked
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
+
     __type(key, __u32);
     __type(value, __u64);
 } blocked_sources SEC(".maps");
 
 
-/* ---------------------------------------------------------
+/* =========================================================
  * Ring Buffer
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 struct
 {
@@ -74,9 +87,9 @@ struct
 } events SEC(".maps");
 
 
-/* ---------------------------------------------------------
+/* =========================================================
  * Send normal packet telemetry
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 static __always_inline void send_packet_event(
     __u64 timestamp,
@@ -85,7 +98,9 @@ static __always_inline void send_packet_event(
     __u16 src_port,
     __u16 dst_port,
     __u8 protocol,
-    __u32 packet_size)
+    __u8 action,
+    __u32 packet_size
+)
 {
     struct kxflow_event *event;
 
@@ -99,32 +114,42 @@ static __always_inline void send_packet_event(
         return;
 
     event->timestamp_ns = timestamp;
+
     event->src_ip = src_ip;
     event->dst_ip = dst_ip;
+
     event->src_port = src_port;
     event->dst_port = dst_port;
+
     event->protocol = protocol;
-    event->action = XDP_PASS;
+    event->action = action;
+
     event->packet_size = packet_size;
+
     event->event_type = KXFLOW_EVENT_PACKET;
     event->severity = KXFLOW_SEVERITY_INFO;
 
-    bpf_ringbuf_submit(event, 0);
+    bpf_ringbuf_submit(
+        event,
+        0
+    );
 }
 
 
-/* ---------------------------------------------------------
+/* =========================================================
  * Send security alert
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 static __always_inline void send_alert_event(
     __u64 timestamp,
     __u32 src_ip,
     __u32 dst_ip,
+    __u16 src_port,
     __u16 dst_port,
     __u8 protocol,
     __u8 action,
-    __u8 severity)
+    __u8 severity
+)
 {
     struct kxflow_event *event;
 
@@ -138,44 +163,50 @@ static __always_inline void send_alert_event(
         return;
 
     event->timestamp_ns = timestamp;
+
     event->src_ip = src_ip;
     event->dst_ip = dst_ip;
-    event->src_port = 0;
+
+    event->src_port = src_port;
     event->dst_port = dst_port;
+
     event->protocol = protocol;
     event->action = action;
+
     event->packet_size = 0;
+
     event->event_type = KXFLOW_EVENT_ALERT;
     event->severity = severity;
 
-    bpf_ringbuf_submit(event, 0);
+    bpf_ringbuf_submit(
+        event,
+        0
+    );
 }
 
 
-/* ---------------------------------------------------------
- * TCP port-scan detection
+/* =========================================================
+ * TCP Port Scan Detection
  *
- * 10 unique destination ports
- * within a 10-second window.
- *
- * When threshold is reached:
- *
- *     detect
- *       ↓
- *     block source
- *       ↓
- *     send ONE alert
- *       ↓
- *     DROP current packet
- * --------------------------------------------------------- */
+ * Returns:
+ *   0 = no scan detected
+ *   1 = scan detected
+ * ========================================================= */
 
 static __always_inline int detect_port_scan(
     __u64 now,
     __u32 src_ip,
     __u32 dst_ip,
-    __u16 dst_port)
+    __u16 dst_port
+)
 {
-    __u64 window_id = now / SCAN_WINDOW_NS;
+    __u64 window_id =
+        now / SCAN_WINDOW_NS;
+
+
+    /* -----------------------------------------------------
+     * Create unique source + destination port + window key
+     * ----------------------------------------------------- */
 
     struct scan_port_key port_key = {
         .src_ip = src_ip,
@@ -183,17 +214,36 @@ static __always_inline int detect_port_scan(
         .window_id = window_id
     };
 
-    __u8 value = 1;
 
     /*
-     * Already observed this source/port/window.
+     * Check whether this source has already
+     * contacted this destination port during
+     * this detection window.
      */
-    if (bpf_map_lookup_elem(&scan_ports, &port_key))
+
+    __u8 *seen =
+        bpf_map_lookup_elem(
+            &scan_ports,
+            &port_key
+        );
+
+
+    /*
+     * Same source + same port + same window.
+     *
+     * Do not count it again.
+     */
+
+    if (seen)
         return 0;
 
+
     /*
-     * Record this unique destination port.
+     * Mark destination port as observed.
      */
+
+    __u8 value = 1;
+
     bpf_map_update_elem(
         &scan_ports,
         &port_key,
@@ -202,15 +252,20 @@ static __always_inline int detect_port_scan(
     );
 
 
-    /*
-     * Find source scan statistics.
-     */
-    struct scan_stats *stats;
+    /* -----------------------------------------------------
+     * Source-level scan statistics
+     * ----------------------------------------------------- */
 
-    stats = bpf_map_lookup_elem(
-        &scan_sources,
-        &src_ip
-    );
+    struct scan_stats *stats =
+        bpf_map_lookup_elem(
+            &scan_sources,
+            &src_ip
+        );
+
+
+    /*
+     * Create source statistics if not present.
+     */
 
     if (!stats)
     {
@@ -233,23 +288,28 @@ static __always_inline int detect_port_scan(
     /*
      * Increment unique destination port count.
      */
+
     stats->unique_ports++;
 
 
-    /*
-     * Threshold reached.
-     *
-     * alert_sent prevents repeated detection alerts
-     * for the same source.
-     */
-    if (stats->unique_ports >= SCAN_PORT_THRESHOLD &&
-        stats->alert_sent == 0)
+    /* -----------------------------------------------------
+     * Detection threshold
+     * ----------------------------------------------------- */
+
+    if (
+        stats->unique_ports >= SCAN_PORT_THRESHOLD &&
+        stats->alert_sent == 0
+    )
     {
         __u64 block_time = now;
 
+
         /*
-         * Mark source as blocked.
+         * -------------------------------------------------
+         * Add source to blocklist
+         * -------------------------------------------------
          */
+
         bpf_map_update_elem(
             &blocked_sources,
             &src_ip,
@@ -257,128 +317,193 @@ static __always_inline int detect_port_scan(
             BPF_ANY
         );
 
+
         /*
-         * Prevent future detection alerts.
+         * Prevent repeated detection alerts.
          */
+
         stats->alert_sent = 1;
+
 
         /*
          * Send exactly ONE security alert.
          *
-         * dst_port is the actual port that triggered
-         * the threshold.
+         * dst_port is the actual port that caused
+         * the threshold to be reached.
          */
+
         send_alert_event(
             now,
             src_ip,
             dst_ip,
+            0,
             dst_port,
             IPPROTO_TCP,
             XDP_DROP,
             KXFLOW_SEVERITY_HIGH
         );
 
+
         /*
-         * Tell caller that this packet must be dropped.
+         * Tell caller to drop the triggering packet.
          */
+
         return 1;
     }
+
 
     return 0;
 }
 
 
-/* ---------------------------------------------------------
+/* =========================================================
  * Main XDP program
- * --------------------------------------------------------- */
+ * ========================================================= */
 
 SEC("xdp")
-int kxflow_xdp(struct xdp_md *ctx)
+int kxflow_xdp(
+    struct xdp_md *ctx
+)
 {
-    void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
+    void *data =
+        (void *)(long)ctx->data;
 
-    struct ethhdr *eth = data;
+    void *data_end =
+        (void *)(long)ctx->data_end;
+
+
+    /* =====================================================
+     * Ethernet parsing
+     * ===================================================== */
+
+    struct ethhdr *eth =
+        data;
+
 
     /*
      * Ethernet bounds check.
      */
+
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
+
     /*
-     * IPv4 only for now.
+     * Only process IPv4 traffic.
+     *
+     * Non-IPv4 traffic is allowed through.
      */
+
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
+
+
+    /* =====================================================
+     * IPv4 parsing
+     * ===================================================== */
 
     struct iphdr *iph =
         (void *)(eth + 1);
 
+
     /*
-     * IPv4 bounds check.
+     * IPv4 header bounds check.
      */
+
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
 
-    __u64 now = bpf_ktime_get_ns();
 
-    __u32 src_ip = iph->saddr;
-    __u32 dst_ip = iph->daddr;
+    /*
+     * Validate IPv4 header length.
+     */
 
-    __u8 protocol = iph->protocol;
+    if (iph->ihl < 5)
+        return XDP_PASS;
+
+
+    __u64 now =
+        bpf_ktime_get_ns();
+
+
+    __u32 src_ip =
+        iph->saddr;
+
+    __u32 dst_ip =
+        iph->daddr;
+
+    __u8 protocol =
+        iph->protocol;
+
 
     __u16 src_port = 0;
     __u16 dst_port = 0;
 
-    /*
-     * ------------------------------------------------------
+
+    __u32 packet_size =
+        (__u32)((char *)data_end -
+                (char *)data);
+
+
+    /* =====================================================
+     * GLOBAL SOURCE BLOCKLIST
+     *
+     * IMPORTANT:
+     *
+     * This check happens immediately after IPv4 parsing.
+     *
+     * Therefore it applies to:
+     *
+     *   TCP
+     *   UDP
+     *   ICMP
+     *   Other IPv4 protocols
+     *
+     * Blocked packets are silently dropped.
+     *
+     * NO alert is generated here.
+     * ===================================================== */
+
+    __u64 *blocked =
+        bpf_map_lookup_elem(
+            &blocked_sources,
+            &src_ip
+        );
+
+
+    if (blocked)
+        return XDP_DROP;
+
+
+    /* =====================================================
      * TCP parsing
-     * ------------------------------------------------------
-     */
+     * ===================================================== */
 
     if (protocol == IPPROTO_TCP)
     {
         struct tcphdr *tcp =
-            (void *)iph + (iph->ihl * 4);
+            (void *)iph +
+            (iph->ihl * 4);
+
 
         /*
          * TCP bounds check.
          */
+
         if ((void *)(tcp + 1) > data_end)
             return XDP_PASS;
 
-        src_port = bpf_ntohs(tcp->source);
-        dst_port = bpf_ntohs(tcp->dest);
+
+        src_port =
+            bpf_ntohs(tcp->source);
+
+        dst_port =
+            bpf_ntohs(tcp->dest);
 
 
-        /*
-         * --------------------------------------------------
-         * Check whether source is already blocked.
-         *
-         * IMPORTANT:
-         * TCP ports are parsed BEFORE this check.
-         *
-         * Blocked packets are silently dropped.
-         * NO alert is generated here.
-         * --------------------------------------------------
-         */
-
-        __u64 *blocked =
-            bpf_map_lookup_elem(
-                &blocked_sources,
-                &src_ip
-            );
-
-        if (blocked)
-            return XDP_DROP;
-
-
-        /*
-         * --------------------------------------------------
+        /* -------------------------------------------------
          * Flow tracking
-         * --------------------------------------------------
-         */
+         * ------------------------------------------------- */
 
         struct flow_key key = {
             .src_ip = src_ip,
@@ -388,12 +513,16 @@ int kxflow_xdp(struct xdp_md *ctx)
             .protocol = protocol
         };
 
+
         struct flow_stats *flow;
 
-        flow = bpf_map_lookup_elem(
-            &flows,
-            &key
-        );
+
+        flow =
+            bpf_map_lookup_elem(
+                &flows,
+                &key
+            );
+
 
         if (flow)
         {
@@ -403,18 +532,23 @@ int kxflow_xdp(struct xdp_md *ctx)
                 (__u64)((char *)data_end -
                         (char *)data);
 
-            flow->last_seen_ns = now;
+            flow->last_seen_ns =
+                now;
         }
         else
         {
             struct flow_stats new_flow = {
                 .packet_count = 1,
+
                 .byte_count =
                     (__u64)((char *)data_end -
                             (char *)data),
+
                 .first_seen_ns = now,
+
                 .last_seen_ns = now
             };
+
 
             bpf_map_update_elem(
                 &flows,
@@ -425,11 +559,9 @@ int kxflow_xdp(struct xdp_md *ctx)
         }
 
 
-        /*
-         * --------------------------------------------------
-         * Port-scan detection
-         * --------------------------------------------------
-         */
+        /* -------------------------------------------------
+         * TCP Port Scan Detection
+         * ------------------------------------------------- */
 
         int scan_detected =
             detect_port_scan(
@@ -439,59 +571,52 @@ int kxflow_xdp(struct xdp_md *ctx)
                 dst_port
             );
 
+
         /*
          * Threshold reached.
          *
          * detect_port_scan() already:
+         *
          *   - added source to blocklist
          *   - sent ONE alert
          *
-         * Now immediately drop the triggering packet.
+         * Drop triggering packet.
          */
+
         if (scan_detected)
             return XDP_DROP;
     }
 
 
-    /*
-     * ------------------------------------------------------
+    /* =====================================================
      * UDP parsing
-     * ------------------------------------------------------
-     */
+     * ===================================================== */
 
     else if (protocol == IPPROTO_UDP)
     {
         struct udphdr *udp =
-            (void *)iph + (iph->ihl * 4);
+            (void *)iph +
+            (iph->ihl * 4);
+
 
         /*
          * UDP bounds check.
          */
+
         if ((void *)(udp + 1) > data_end)
             return XDP_PASS;
 
-        src_port = bpf_ntohs(udp->source);
-        dst_port = bpf_ntohs(udp->dest);
+
+        src_port =
+            bpf_ntohs(udp->source);
+
+        dst_port =
+            bpf_ntohs(udp->dest);
 
 
-        /*
-         * Block already-blacklisted sources.
-         *
-         * No alert.
-         */
-        __u64 *blocked =
-            bpf_map_lookup_elem(
-                &blocked_sources,
-                &src_ip
-            );
-
-        if (blocked)
-            return XDP_DROP;
-
-
-        /*
-         * Flow tracking.
-         */
+        /* -------------------------------------------------
+         * Flow tracking
+         * ------------------------------------------------- */
 
         struct flow_key key = {
             .src_ip = src_ip,
@@ -501,12 +626,16 @@ int kxflow_xdp(struct xdp_md *ctx)
             .protocol = protocol
         };
 
+
         struct flow_stats *flow;
 
-        flow = bpf_map_lookup_elem(
-            &flows,
-            &key
-        );
+
+        flow =
+            bpf_map_lookup_elem(
+                &flows,
+                &key
+            );
+
 
         if (flow)
         {
@@ -516,18 +645,23 @@ int kxflow_xdp(struct xdp_md *ctx)
                 (__u64)((char *)data_end -
                         (char *)data);
 
-            flow->last_seen_ns = now;
+            flow->last_seen_ns =
+                now;
         }
         else
         {
             struct flow_stats new_flow = {
                 .packet_count = 1,
+
                 .byte_count =
                     (__u64)((char *)data_end -
                             (char *)data),
+
                 .first_seen_ns = now,
+
                 .last_seen_ns = now
             };
+
 
             bpf_map_update_elem(
                 &flows,
@@ -539,11 +673,24 @@ int kxflow_xdp(struct xdp_md *ctx)
     }
 
 
-    /*
-     * ------------------------------------------------------
+    /* =====================================================
+     * ICMP
+     *
+     * No ports.
+     *
+     * Global blocklist has already been checked above.
+     * ===================================================== */
+
+    else if (protocol == IPPROTO_ICMP)
+    {
+        src_port = 0;
+        dst_port = 0;
+    }
+
+
+    /* =====================================================
      * Normal packet telemetry
-     * ------------------------------------------------------
-     */
+     * ===================================================== */
 
     send_packet_event(
         now,
@@ -552,16 +699,21 @@ int kxflow_xdp(struct xdp_md *ctx)
         src_port,
         dst_port,
         protocol,
-        (__u32)((char *)data_end -
-                (char *)data)
+        XDP_PASS,
+        packet_size
     );
 
 
-    /*
-     * Normal traffic is allowed.
-     */
+    /* =====================================================
+     * Allow packet
+     * ===================================================== */
+
     return XDP_PASS;
 }
 
+
+/* =========================================================
+ * License
+ * ========================================================= */
 
 char LICENSE[] SEC("license") = "GPL";
