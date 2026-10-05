@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+
+# Temporary/debug output
+result.txt
+
+# Editor / OS files
+*.swp
+*.swo
+*~
+.DS_Store
